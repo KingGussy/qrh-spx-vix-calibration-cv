@@ -1,0 +1,10 @@
+numpy>=1.24
+matplotlib>=3.7
+pandas>=2.0
+scipy>=1.10
+pytest>=8.0
+pre-commit>=3.7
+black>=24.3
+isort>=5.13
+flake8>=7.0
+mypy>=1.10

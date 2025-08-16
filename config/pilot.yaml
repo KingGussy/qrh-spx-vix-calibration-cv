@@ -1,0 +1,25 @@
+market:
+  S0: 100.0
+  r: 0.0
+  q: 0.0
+option:
+  T: 0.5
+  K_list: [100.0]
+kernel:
+  H: 0.10
+  n_factors: 10
+  T_max: 1.0
+sim:
+  m_paths: 5000
+  n_steps: 252
+  seed: 12345
+  sigma_cap: 1.5
+  z_cap: 8.0
+params:
+  a: 0.4
+  b: -0.3
+  c: 0.01
+  lam: 1.0
+  eta: 0.6
+z0:
+  range: [-0.05, 0.05] 
