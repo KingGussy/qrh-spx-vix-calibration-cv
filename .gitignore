@@ -1,0 +1,45 @@
+# venv
+.venv/
+venv/
+ENV/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# notebooks
+.ipynb_checkpoints/
+lab/
+
+# OS / IDE
+.DS_Store
+.vscode/
+
+# data & outputs
+data/
+outputs/
+results/
+
+# old stuff
+old/
+old_t_ests/
+
+# build artifacts
+build/
+dist/
+*.egg-info/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+.ninja*
+*.so
+*.dll
+*.dylib
+
+#unused utils
+src/qrh_sim/stats_utils.py
+src/qrh_sim/plots.py
+src/qrh_sim/plot_utils.py

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "pybind11>=2.11", "cmake>=3.24", "ninja>=1.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "qrh-sim"
+version = "0.0.1"
+description = "QRH/LRH simulators (CPU + CUDA)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[tool.scikit-build]
+# Tell scikit-build-core that Python packages live under src/
+wheel.packages = ["qrh_sim"]
+# If you later add subpackages, this still works as long as they're inside qrh_sim/
+
+# optional but helpful:
+cmake.minimum-version = "3.24"
+ninja.minimum-version = "1.11"
