@@ -8,6 +8,12 @@ CUDA-accelerated simulator + synthetic data generator for the Quadratic Rough He
 - `scripts/sim_paths_cuda.cu` + CMake/pyproject — CUDA extension sources and build config
 - `tests/` — quick sanity tests (WIP)
 
+
+
+## Models
+- full_mtp = baseline ResMLP, outputs to a fixed k-grid   -nn/model
+- 
+
 ## Quickstart
 Create a venv and install editable:
 ```bash

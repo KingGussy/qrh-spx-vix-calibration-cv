@@ -7,6 +7,9 @@ def norm_cdf(x: float) -> float:
     # standard normal CDF
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+def norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
 def black_call_forward(F: float, K: float, T: float, sigma: float) -> float:
     # Black(76) call on forward, undiscounted (df=1).
     if T <= 0.0:
@@ -24,11 +27,11 @@ def black_call_forward(F: float, K: float, T: float, sigma: float) -> float:
 def implied_vol_black_forward(C: float, F: float, K: float, T: float,
                               sigma_lo: float = 1e-8, sigma_hi: float = 5.0) -> float:
     """
-    Robust implied vol for undiscounted Black call:
+    implied vol for undiscounted Black call:
       C = BlackCall(F,K,T,sigma)
     """
-    if T <= 0.0:
-        return 0.0
+    # if T <= 0.0:
+    #     return 0.0
 
     # no-arb bounds (undiscounted):
     intrinsic = max(F - K, 0.0)
@@ -69,7 +72,8 @@ def implied_vol_black_forward(C: float, F: float, K: float, T: float,
 
 # in the CV demo
 def bs_call_price(S0, K, T, sigma, r=0.0, q=0.0):
-    """ Calculates the price of a European call under BS """
+    # European call price under BS
+
     # if T <= 0:
     #     return max(S0*np.exp(-q*T) - K*np.exp(-r*T), 0.0)
     sigma = max(float(sigma), 1e-12)
@@ -87,10 +91,9 @@ def bs_implied_vol_call(price, S0, K, T, r=0.0, q=0.0, lo=1e-6, hi=5.0, tol=1e-7
     # Expand hi if needed
     while phi < price and hi < 1000: hi *= 2.0; phi = pv(hi)
 
-    if price <= plo: 
-        return lo
-    if price >= phi:
-        return hi
+    if price <= plo: return lo
+    if price >= phi: return hi
+
     for _ in range(iters):
         mid = 0.5*(lo+hi)
         pm  = pv(mid)
@@ -101,6 +104,25 @@ def bs_implied_vol_call(price, S0, K, T, r=0.0, q=0.0, lo=1e-6, hi=5.0, tol=1e-7
         else:
             lo = mid
     return 0.5*(lo+hi)
+
+
+# greeks for hedging
+def bs_call_delta(S: float, K: float, T: float, sigma: float, r: float = 0.0, q: float = 0.0) -> float:
+    # if T <= 0:
+    #     return 1.0 if S > K else 0.0
+    # if sigma <= 0:
+    #     return 1.0 if math.exp(-q * T) * S > math.exp(-r * T) * K else 0.0
+    vol_sqrt_T = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / vol_sqrt_T
+    return math.exp(-q * T) * norm_cdf(d1)
+
+
+def bs_vega(S: float, K: float, T: float, sigma: float, r: float = 0.0, q: float = 0.0) -> float:
+    # if T <= 0 or sigma <= 0:
+    #     return 0.0
+    vol_sqrt_T = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / vol_sqrt_T
+    return math.exp(-q * T) * S * math.sqrt(T) * norm_pdf(d1)
 
 
 

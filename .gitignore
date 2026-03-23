@@ -3,6 +3,8 @@
 venv/
 ENV/
 
+.env
+
 # python cache
 __pycache__/
 *.pyc
@@ -20,10 +22,20 @@ lab/
 data/
 outputs/
 results/
+logs/
+wandb/
 
-# old stuff
-old/
-old_t_ests/
+# model artifacts
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# test / coverage cache
+.pytest_cache/
+.coverage
+htmlcov/
 
 # build artifacts
 build/
@@ -39,7 +51,17 @@ Makefile
 *.dll
 *.dylib
 
-#unused utils
+# old stuff
+old/
+old_t_ests/
+
+# local cache
+.cache/
+
+# unused utils
 src/qrh_sim/stats_utils.py
 src/qrh_sim/plots.py
 src/qrh_sim/plot_utils.py
+
+# notes
+tempnotes.txt
