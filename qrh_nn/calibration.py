@@ -15,8 +15,8 @@ PARAM_NAMES = ["a", "b", "c", "lam", "eta"] + [f"z0_{i}" for i in range(10)]
 LOW = np.array([0.1, 0.01, 0.0001, 0.5, 1.0] + [-0.5] * 10, dtype=np.float32)
 HIGH = np.array([0.6, 0.5, 0.03, 2.5, 1.5] + [0.5] * 10, dtype=np.float32)
 
-V1_N_STARTS = 6
-V1_LBFGS_STEPS = 80
+N_STARTS = 6
+LBFGS_STEPS = 80
 
 from qrh_nn.model import ResMLP as ResMLP_fixed
 from qrh_nn.model import ResMLPConfig as ResMLPConfig_fixed
@@ -30,8 +30,13 @@ from qrh_nn.eval_utils import (
     _device_or_default, _as_t
 )
 
+# weighted loss params
+WEIGHT_EPS = 1e-4
+WEIGHT_TAU = 0.10
+WEIGHT_NORM = True
 
 
+# convert between bounded and unbounded params for optimisation
 def theta_from_u_bounded(u: torch.Tensor) -> torch.Tensor:
     low = torch.tensor(LOW, dtype=torch.float32, device=u.device)
     high = torch.tensor(HIGH, dtype=torch.float32, device=u.device)
@@ -45,13 +50,12 @@ def u_from_theta_bounded(theta_np: np.ndarray, eps: float = 1e-6) -> np.ndarray:
 
 
 # random starting params
-def make_default_starts(n_starts: int = V1_N_STARTS, seed: int = 123) -> list[np.ndarray]:
+def make_default_starts(n_starts: int = N_STARTS, seed: int = 123) -> list[np.ndarray]:
     rng = np.random.default_rng(seed)
     starts = [((LOW + HIGH) / 2.0).astype(np.float32)]
     for _ in range(n_starts - 1):
         starts.append(rng.uniform(LOW, HIGH).astype(np.float32))
     return starts
-
 
 
 def linear_interp(xp: torch.Tensor, fp: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -66,12 +70,110 @@ def linear_interp(xp: torch.Tensor, fp: torch.Tensor, x: torch.Tensor) -> torch.
     w = (x - x0) / (x1 - x0 + 1e-12)
     return y0 + w * (y1 - y0)
 
+# loss utils
+def build_iv_weights(
+    k_obs: np.ndarray,
+    iv_bid: Optional[np.ndarray],
+    iv_ask: Optional[np.ndarray],
+    *,
+    eps: float = WEIGHT_EPS,
+    tau: float = WEIGHT_TAU,
+    normalise: bool = WEIGHT_NORM,
+) -> np.ndarray:
+    k_obs = np.asarray(k_obs, dtype=np.float32)
+    w = np.exp(-0.5 * (k_obs / tau) ** 2).astype(np.float32)
+
+    if iv_bid is not None and iv_ask is not None:
+        spread = np.maximum(np.asarray(iv_ask, dtype=np.float32) - np.asarray(iv_bid, dtype=np.float32), 0.0)
+        w = w / (eps + spread)
+
+    if normalise:
+        s = float(np.sum(w))
+        if s > 0:
+            w = w / s
+        else:
+            w = np.ones_like(w, dtype=np.float32) / len(w)
+
+    return w.astype(np.float32)
+
+def weighted_smile_mse_t(iv_hat_t: torch.Tensor, iv_obs_t: torch.Tensor, w_t: torch.Tensor) -> torch.Tensor:
+    err2 = (iv_hat_t - iv_obs_t) ** 2
+    return torch.sum(w_t * err2)
 
 def _rmse_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean((a - b) ** 2))
 
 
+
 # metrics and ...
+# weighted metrics helpers:
+# weighted RMSE
+def weighted_smile_error_metrics(
+    iv_hat: np.ndarray,
+    iv_obs: np.ndarray,
+    w: np.ndarray,
+) -> Dict[str, float]:
+    iv_hat = np.asarray(iv_hat, dtype=np.float32)
+    iv_obs = np.asarray(iv_obs, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float32)
+
+    err = iv_hat - iv_obs
+    w_sum = float(np.sum(w))
+
+    if w_sum <= 0.0:
+        return {
+            "weighted_mse": float("nan"),
+            "weighted_rmse": float("nan"),
+            "weighted_mae": float("nan"),
+        }
+
+    weighted_mse = float(np.sum(w * err**2) / w_sum)
+    weighted_rmse = float(np.sqrt(weighted_mse))
+    weighted_mae = float(np.sum(w * np.abs(err)) / w_sum)
+
+    return {
+        "weighted_mse": weighted_mse,
+        "weighted_rmse": weighted_rmse,
+        "weighted_mae": weighted_mae,
+    }
+# ATM band 
+import numpy as np
+from typing import Dict
+
+def smile_error_metrics_atm_band(
+    iv_hat: np.ndarray,
+    iv_obs: np.ndarray,
+    k_obs: np.ndarray,
+    *,
+    k_band: float = 0.05,
+) -> Dict[str, float]:
+    iv_hat = np.asarray(iv_hat, dtype=np.float32)
+    iv_obs = np.asarray(iv_obs, dtype=np.float32)
+    k_obs = np.asarray(k_obs, dtype=np.float32)
+
+    mask = np.abs(k_obs) <= k_band
+    if not np.any(mask):
+        return {
+            "rmse_atm_band": float("nan"),
+            "mae_atm_band": float("nan"),
+            "max_abs_err_atm_band": float("nan"),
+            "n_atm_band": 0,
+            "k_band": float(k_band),
+        }
+
+    err = iv_hat[mask] - iv_obs[mask]
+
+    return {
+        "rmse_atm_band": float(np.sqrt(np.mean(err**2))),
+        "mae_atm_band": float(np.mean(np.abs(err))),
+        "max_abs_err_atm_band": float(np.max(np.abs(err))),
+        "n_atm_band": int(mask.sum()),
+        "k_band": float(k_band),
+    }
+
+
+
+
 def smile_error_metrics(iv_hat: np.ndarray, iv_obs: np.ndarray) -> Dict[str, float]:
     iv_hat = np.asarray(iv_hat, dtype=np.float64)
     iv_obs = np.asarray(iv_obs, dtype=np.float64)
@@ -184,12 +286,29 @@ def calibrate_fixedk_from_smile(
     iv_obs: np.ndarray,
     T_raw: float,
     *,
+    iv_bid: Optional[np.ndarray] = None,
+    iv_ask: Optional[np.ndarray] = None,
+    use_weights: bool = False,
     device: Optional[torch.device | str] = None,
-    n_starts: int = V1_N_STARTS,
-    lbfgs_steps: int = V1_LBFGS_STEPS,
+    n_starts: int = N_STARTS,
+    lbfgs_steps: int = LBFGS_STEPS,
+    weight_tau: float = WEIGHT_TAU,
 ) -> Dict[str, object]:
     device = _device_or_default(device)
     model, cfg, X_mu, X_sd, Y_mu, Y_sd = load_model_and_norm("fixed", device)
+
+    if use_weights:
+        w_np = build_iv_weights(
+            np.asarray(k_obs, dtype=np.float32),
+            None if iv_bid is None else np.asarray(iv_bid, dtype=np.float32),
+            None if iv_ask is None else np.asarray(iv_ask, dtype=np.float32),
+            tau=weight_tau
+        )
+    else:
+        w_np = np.ones_like(np.asarray(k_obs, dtype=np.float32))
+        w_np = w_np / np.sum(w_np)
+
+    w_t = _as_t(w_np, device)
 
     k_obs_t = _as_t(np.asarray(k_obs, dtype=np.float32), device)
     iv_obs_t = _as_t(np.asarray(iv_obs, dtype=np.float32), device)
@@ -210,7 +329,7 @@ def calibrate_fixedk_from_smile(
             iv0 = predict_fixedk_smile_from_theta(
                 model, theta0, T_raw, k_obs_t, X_mu, X_sd, Y_mu, Y_sd, device
             )
-            init_loss = torch.mean((iv0 - iv_obs_t) ** 2).item()
+            init_loss = weighted_smile_mse_t(iv0, iv_obs_t, w_t).item()
 
         opt = torch.optim.LBFGS([u], lr=0.8, max_iter=lbfgs_steps, line_search_fn="strong_wolfe")
 
@@ -220,7 +339,7 @@ def calibrate_fixedk_from_smile(
             iv_hat = predict_fixedk_smile_from_theta(
                 model, theta, T_raw, k_obs_t, X_mu, X_sd, Y_mu, Y_sd, device
             )
-            loss = torch.mean((iv_hat - iv_obs_t) ** 2)
+            loss = weighted_smile_mse_t(iv_hat, iv_obs_t, w_t)
             loss.backward()
             return loss
 
@@ -231,26 +350,62 @@ def calibrate_fixedk_from_smile(
             iv_hat = predict_fixedk_smile_from_theta(
                 model, theta_hat, T_raw, k_obs_t, X_mu, X_sd, Y_mu, Y_sd, device
             )
-            final_loss = torch.mean((iv_hat - iv_obs_t) ** 2).item()
-            rmse = _rmse_t(iv_hat, iv_obs_t).item()
+            final_loss = weighted_smile_mse_t(iv_hat, iv_obs_t, w_t).item()
 
-        metrics = smile_error_metrics(
-            iv_hat.detach().cpu().numpy(),
-            np.asarray(iv_obs, dtype=np.float32),
+        iv_hat_np = iv_hat.detach().cpu().numpy()
+        iv_obs_np = np.asarray(iv_obs, dtype=np.float32)
+        k_obs_np = np.asarray(k_obs, dtype=np.float32)
+
+        metrics = smile_error_metrics(iv_hat_np, iv_obs_np)
+
+        weighted_metrics = weighted_smile_error_metrics(
+            iv_hat_np,
+            iv_obs_np,
+            w_np,
+        )
+
+        atm_metrics_003 = smile_error_metrics_atm_band(
+            iv_hat_np,
+            iv_obs_np,
+            k_obs_np,
+            k_band=0.03,
+        )
+        atm_metrics_005 = smile_error_metrics_atm_band(
+            iv_hat_np,
+            iv_obs_np,
+            k_obs_np,
+            k_band=0.05,
+        )
+        atm_metrics_007 = smile_error_metrics_atm_band(
+            iv_hat_np,
+            iv_obs_np,
+            k_obs_np,
+            k_band=0.07,
         )
 
         row = {
             "theta_hat_raw": theta_hat.detach().cpu().numpy(),
-            "iv_hat": iv_hat.detach().cpu().numpy(),
+            "iv_hat": iv_hat_np,
             "init_loss": float(init_loss),
             "final_loss": float(final_loss),
+
+            "metrics": metrics,
+            "weighted_metrics": weighted_metrics,
+            "atm_metrics_003": atm_metrics_003,
+            "atm_metrics_005": atm_metrics_005,
+            "atm_metrics_007": atm_metrics_007,
+
             "rmse": metrics["rmse"],
             "mae": metrics["mae"],
             "max_abs_err": metrics["max_abs_err"],
             "mean_signed_err": metrics["mean_signed_err"],
-            "method": "fixedk_v1",   # or ctsk_v1
-            "k_obs": np.asarray(k_obs, dtype=np.float32),
-            "iv_obs": np.asarray(iv_obs, dtype=np.float32),
+
+            "use_weights": bool(use_weights),
+            "quote_weights": w_np,
+
+            "method": "fixedk_v1",
+            "k_obs": k_obs_np,
+            "iv_obs": iv_obs_np,
             "T_raw": float(T_raw),
             "param_names": PARAM_NAMES,
         }
@@ -268,14 +423,39 @@ def calibrate_fixedk_joint_from_smiles(
     iv_obs_vix: np.ndarray,
     T_raw: float,
     *,
+    iv_bid_spx: Optional[np.ndarray] = None,
+    iv_ask_spx: Optional[np.ndarray] = None,
+    iv_bid_vix: Optional[np.ndarray] = None,
+    iv_ask_vix: Optional[np.ndarray] = None,
+    use_weights: bool = False,
     w_spx: float = 1.0,
     w_vix: float = 1.0,
     device: Optional[torch.device | str] = None,
-    n_starts: int = V1_N_STARTS,
-    lbfgs_steps: int = V1_LBFGS_STEPS,
+    n_starts: int = N_STARTS,
+    lbfgs_steps: int = LBFGS_STEPS,
 ) -> Dict[str, object]:
     device = _device_or_default(device)
     model, cfg, X_mu, X_sd, Y_mu, Y_sd = load_model_and_norm("fixed", device)
+
+    if use_weights:
+        w_spx_np = build_iv_weights(
+            np.asarray(k_obs_spx, dtype=np.float32),
+            None if iv_bid_spx is None else np.asarray(iv_bid_spx, dtype=np.float32),
+            None if iv_ask_spx is None else np.asarray(iv_ask_spx, dtype=np.float32),
+        )
+        w_vix_np = build_iv_weights(
+            np.asarray(k_obs_vix, dtype=np.float32),
+            None if iv_bid_vix is None else np.asarray(iv_bid_vix, dtype=np.float32),
+            None if iv_ask_vix is None else np.asarray(iv_ask_vix, dtype=np.float32),
+        )
+    else:
+        w_spx_np = np.ones_like(np.asarray(k_obs_spx, dtype=np.float32))
+        w_spx_np /= np.sum(w_spx_np)
+        w_vix_np = np.ones_like(np.asarray(k_obs_vix, dtype=np.float32))
+        w_vix_np /= np.sum(w_vix_np)
+
+    w_spx_t = _as_t(w_spx_np, device)
+    w_vix_t = _as_t(w_vix_np, device)
 
     k_obs_spx_t = _as_t(np.asarray(k_obs_spx, dtype=np.float32), device)
     iv_obs_spx_t = _as_t(np.asarray(iv_obs_spx, dtype=np.float32), device)
@@ -302,8 +482,8 @@ def calibrate_fixedk_joint_from_smiles(
                 X_mu, X_sd, Y_mu, Y_sd, device
             )
             init_loss = (
-                w_spx * torch.mean((spx0 - iv_obs_spx_t) ** 2)
-                + w_vix * torch.mean((vix0 - iv_obs_vix_t) ** 2)
+                w_spx * weighted_smile_mse_t(spx0, iv_obs_spx_t, w_spx_t)
+                + w_vix * weighted_smile_mse_t(vix0, iv_obs_vix_t, w_vix_t)
             ).item()
 
         opt = torch.optim.LBFGS([u], lr=0.8, max_iter=lbfgs_steps, line_search_fn="strong_wolfe")
@@ -317,9 +497,9 @@ def calibrate_fixedk_joint_from_smiles(
                 X_mu, X_sd, Y_mu, Y_sd, device
             )
             loss = (
-                w_spx * torch.mean((spx_hat - iv_obs_spx_t) ** 2)
-                + w_vix * torch.mean((vix_hat - iv_obs_vix_t) ** 2)
-            )
+                w_spx * weighted_smile_mse_t(spx_hat, iv_obs_spx_t, w_spx_t)
+                + w_vix * weighted_smile_mse_t(vix_hat, iv_obs_vix_t, w_vix_t)
+            )#.item()
             loss.backward()
             return loss
 
@@ -333,12 +513,39 @@ def calibrate_fixedk_joint_from_smiles(
                 X_mu, X_sd, Y_mu, Y_sd, device
             )
             final_loss = (
-                w_spx * torch.mean((spx_hat - iv_obs_spx_t) ** 2)
-                + w_vix * torch.mean((vix_hat - iv_obs_vix_t) ** 2)
+                w_spx * weighted_smile_mse_t(spx_hat, iv_obs_spx_t, w_spx_t)
+                + w_vix * weighted_smile_mse_t(vix_hat, iv_obs_vix_t, w_vix_t)
             ).item()
 
         spx_hat_np = spx_hat.detach().cpu().numpy()
         vix_hat_np = vix_hat.detach().cpu().numpy()
+
+        spx_metrics = smile_error_metrics(spx_hat_np, np.asarray(iv_obs_spx, dtype=np.float32))
+        vix_metrics = smile_error_metrics(vix_hat_np, np.asarray(iv_obs_vix, dtype=np.float32))
+
+        spx_weighted_metrics = weighted_smile_error_metrics(
+            spx_hat_np,
+            np.asarray(iv_obs_spx, dtype=np.float32),
+            w_spx_np,
+        )
+        vix_weighted_metrics = weighted_smile_error_metrics(
+            vix_hat_np,
+            np.asarray(iv_obs_vix, dtype=np.float32),
+            w_vix_np,
+        )
+
+        spx_atm_metrics = smile_error_metrics_atm_band(
+            spx_hat_np,
+            np.asarray(iv_obs_spx, dtype=np.float32),
+            np.asarray(k_obs_spx, dtype=np.float32),
+            k_band=0.05,
+        )
+        vix_atm_metrics = smile_error_metrics_atm_band(
+            vix_hat_np,
+            np.asarray(iv_obs_vix, dtype=np.float32),
+            np.asarray(k_obs_vix, dtype=np.float32),
+            k_band=0.05,
+        )
 
         row = {
             "theta_hat_raw": theta_hat.detach().cpu().numpy(),
@@ -346,8 +553,15 @@ def calibrate_fixedk_joint_from_smiles(
             "vix_iv_hat": vix_hat_np,
             "init_loss": float(init_loss),
             "final_loss": float(final_loss),
-            "spx_metrics": smile_error_metrics(spx_hat_np, np.asarray(iv_obs_spx, dtype=np.float32)),
-            "vix_metrics": smile_error_metrics(vix_hat_np, np.asarray(iv_obs_vix, dtype=np.float32)),
+            "spx_metrics": spx_metrics,
+            "vix_metrics": vix_metrics,
+            "spx_weighted_metrics": spx_weighted_metrics,
+            "vix_weighted_metrics": vix_weighted_metrics,
+            "spx_atm_metrics": spx_atm_metrics,
+            "vix_atm_metrics": vix_atm_metrics,
+            "use_weights": bool(use_weights),
+            "quote_weights_spx": w_spx_np,
+            "quote_weights_vix": w_vix_np,
             "method": "fixedk_joint",
             "k_obs_spx": np.asarray(k_obs_spx, dtype=np.float32),
             "iv_obs_spx": np.asarray(iv_obs_spx, dtype=np.float32),
@@ -368,8 +582,8 @@ def calibrate_ctsk_from_smile(
     T_raw: float,
     *,
     device: Optional[torch.device | str] = None,
-    n_starts: int = V1_N_STARTS,
-    lbfgs_steps: int = V1_LBFGS_STEPS,
+    n_starts: int = N_STARTS,
+    lbfgs_steps: int = LBFGS_STEPS,
 ) -> Dict[str, object]:
     device = _device_or_default(device)
     model, cfg, X_mu, X_sd, Y_mu, Y_sd = load_model_and_norm("ctsk", device) #load_ctsk_model_and_norm(device)
@@ -455,6 +669,10 @@ def save_fixedk_joint_summary(res: Dict[str, object], out_json: Path) -> None:
         "vix_metrics": res["vix_metrics"],
         "theta_hat_raw": np.asarray(res["theta_hat_raw"]).tolist(),
         "param_names": list(res["param_names"]),
+        "spx_weighted_metrics": res.get("spx_weighted_metrics"),
+        "vix_weighted_metrics": res.get("vix_weighted_metrics"),
+        "spx_atm_metrics": res.get("spx_atm_metrics"),
+        "vix_atm_metrics": res.get("vix_atm_metrics"),
     }
     out_json.parent.mkdir(parents=True, exist_ok=True)
     with open(out_json, "w") as f:

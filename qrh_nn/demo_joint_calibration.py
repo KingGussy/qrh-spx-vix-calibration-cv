@@ -15,6 +15,8 @@ from src.qrh_sim.pricing_utils import norm_cdf, bs_call_price, bs_implied_vol_ca
 from qrh_nn.calibration import (
     calibrate_fixedk_joint_from_smiles,
     save_fixedk_joint_summary,
+    weighted_smile_error_metrics,
+    smile_error_metrics_atm_band
 )
 
 
@@ -24,7 +26,7 @@ SPX_PATH = REPO / "data" / "hedging_data" / "raw" / "corrected" / "0105" / "SPX_
 VIX_CALL_PATH = REPO / "data" / "hedging_data" / "raw" / "corrected" / "0105" / "VIX_0105_calls" / "day0_chain.csv"
 VIX_PUT_PATH = REPO / "data" / "hedging_data" / "raw" / "corrected" / "0105" / "VIX_0105_puts" / "day0_chain.csv"
 
-OUT_DIR = REPO / "models" / "calibration_joint_real_final"
+OUT_DIR = REPO / "models" / "joint_calibrations" / "calibration_joint_real_TEST_WEIGHTS_10"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -196,6 +198,11 @@ def plot_fixedk_joint_realdata_result(
     spx_used: pd.DataFrame,
     vix_used: pd.DataFrame,
     out_dir: Optional[Path] = None,
+    *,
+    title_suffix: str = "",
+    file_stem: str = "fixedk_joint",
+    overlay_res: Optional[Dict[str, object]] = None,
+    overlay_label: str = "overlay fit",
 ) -> None:
     if out_dir is not None:
         out_dir = Path(out_dir)
@@ -205,28 +212,52 @@ def plot_fixedk_joint_realdata_result(
     plt.figure(figsize=(7, 4))
     plt.scatter(spx_used["k_log_money"], spx_used["iv_bid_filled"], marker="x", s=18, color="tomato", label="SPX bid IV")
     plt.scatter(spx_used["k_log_money"], spx_used["iv_ask_filled"], marker="x", s=18, color="mediumslateblue", label="SPX ask IV")
-    plt.plot(res["k_obs_spx"], res["spx_iv_hat"], linewidth=1.8, color="forestgreen", label="SPX fitted")
+
+    plt.plot(res["k_obs_spx"], res["spx_iv_hat"], linewidth=1.2, color="seagreen", label="SPX fitted")
+
+    if overlay_res is not None:
+        plt.plot(
+            overlay_res["k_obs_spx"],
+            overlay_res["spx_iv_hat"],
+            linewidth=1.2,
+            color="gold",
+            linestyle="--",
+            label=overlay_label,
+        )
+
     plt.xlabel("log-moneyness k")
     plt.ylabel("implied vol")
-    plt.title("Fixed-k joint calibration | SPX | 30 DTE")
+    plt.title(f"Fixed-k joint calibration | SPX | 30 DTE{title_suffix}")
     plt.legend()
     plt.tight_layout()
     if out_dir is not None:
-        plt.savefig(out_dir / "fixedk_joint_spx.png", dpi=150)
+        plt.savefig(out_dir / f"{file_stem}_spx.png", dpi=150)
     plt.show()
 
     # VIX
     plt.figure(figsize=(7, 4))
-    plt.scatter(vix_used["k_log_money"], vix_used["iv_bid_filled"], marker="x", s=18, color="tomato", label="VIX bid IV")
-    plt.scatter(vix_used["k_log_money"], vix_used["iv_ask_filled"], marker="x", s=18, color="mediumslateblue", label="VIX ask IV")
-    plt.plot(res["k_obs_vix"], res["vix_iv_hat"], linewidth=1.5, color="forestgreen", label="VIX fitted")
+    plt.scatter(vix_used["k_log_money"], vix_used["iv_bid_filled"], marker="x", s=18, color="tomato", label="SPX bid IV")
+    plt.scatter(vix_used["k_log_money"], vix_used["iv_ask_filled"], marker="x", s=18, color="mediumslateblue", label="SPX ask IV")
+
+    plt.plot(res["k_obs_vix"], res["vix_iv_hat"], linewidth=1.2, color="seagreen", label="SPX fitted")
+
+    if overlay_res is not None:
+        plt.plot(
+            overlay_res["k_obs_vix"],
+            overlay_res["vix_iv_hat"],
+            color="gold",
+            linewidth=1.2,
+            #linestyle="--",
+            label=overlay_label,
+        )
+
     plt.xlabel("log-moneyness k")
     plt.ylabel("implied vol")
-    plt.title("Fixed-k joint calibration | VIX | 30 DTE")
+    plt.title(f"Fixed-k joint calibration | SPX | 30 DTE{title_suffix}")
     plt.legend()
     plt.tight_layout()
     if out_dir is not None:
-        plt.savefig(out_dir / "fixedk_joint_vix.png", dpi=150)
+        plt.savefig(out_dir / f"{file_stem}_vix.png", dpi=150)
     plt.show()
 
 def main():
@@ -265,17 +296,58 @@ def main():
         T_raw=T_raw,
     )
 
-    print("Final joint loss:", res["final_loss"])
-    print("SPX metrics:", res["spx_metrics"])
-    print("VIX metrics:", res["vix_metrics"])
+    res_weighted = calibrate_fixedk_joint_from_smiles(
+        k_obs_spx=k_spx,
+        iv_obs_spx=iv_spx,
+        k_obs_vix=k_vix,
+        iv_obs_vix=iv_vix,
+        T_raw=T_raw,
+        iv_bid_spx=spx_used["iv_bid_filled"].to_numpy(dtype=np.float32),
+        iv_ask_spx=spx_used["iv_ask_filled"].to_numpy(dtype=np.float32),
+        iv_bid_vix=vix_used["iv_bid_filled"].to_numpy(dtype=np.float32),
+        iv_ask_vix=vix_used["iv_ask_filled"].to_numpy(dtype=np.float32),
+        use_weights=True,
+    )
+
+    print("Uniform final joint loss:", res["final_loss"])
+    print("Uniform SPX metrics:", res["spx_metrics"])
+    print("Uniform VIX metrics:", res["vix_metrics"])
+
+    print("Weighted final joint loss:", res_weighted["final_loss"])
+    print("Weighted SPX metrics:", res_weighted["spx_metrics"])
+    print("Weighted VIX metrics:", res_weighted["vix_metrics"])
+
+    save_fixedk_joint_summary(res, OUT_DIR / "fixedk_joint_summary_uniform.json")
+    save_fixedk_joint_summary(res_weighted, OUT_DIR / "fixedk_joint_summary_weighted.json")
 
     plot_fixedk_joint_realdata_result(
         res,
         spx_used=spx_used,
         vix_used=vix_used,
         out_dir=OUT_DIR,
+        title_suffix=" | uniform loss",
+        file_stem="fixedk_joint_uniform",
     )
-    save_fixedk_joint_summary(res, OUT_DIR / "fixedk_joint_summary.json")
+
+    plot_fixedk_joint_realdata_result(
+        res_weighted,
+        spx_used=spx_used,
+        vix_used=vix_used,
+        out_dir=OUT_DIR,
+        title_suffix=" | weighted loss",
+        file_stem="fixedk_joint_weighted",
+    )
+
+    plot_fixedk_joint_realdata_result(
+        res,
+        spx_used=spx_used,
+        vix_used=vix_used,
+        out_dir=OUT_DIR,
+        title_suffix=" | uniform vs weighted",
+        file_stem="fixedk_joint_compare",
+        overlay_res=res_weighted,
+        overlay_label="weighted fitted",
+    )
 
 if __name__ == "__main__":
     main()

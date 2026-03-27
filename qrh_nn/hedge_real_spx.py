@@ -401,7 +401,15 @@ def summarise_hedge(df: pd.DataFrame, col: str) -> Dict[str, float]:
     }
 
 
-def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: float, q: float, device: torch.device):
+def run_hedge(
+    data_dir: Path,
+    out_dir: Path,
+    k_min: float,
+    k_max: float,
+    r: float,
+    q: float,
+    device: torch.device,
+):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     quotes = load_held_quotes(data_dir)
@@ -411,7 +419,7 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
     K = float(quotes["strike"].dropna().iloc[0])
     if K is None:
         raise RuntimeError("Need strike column in held quotes for this script.")
-    
+
     # grab expiration date from unix
     if "expiration" in quotes.columns:
         exp_raw = quotes["expiration"].iloc[0]
@@ -425,34 +433,80 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
     # --------------------------------------------------------
     # Day-0 calibration
     # --------------------------------------------------------
-
     chain0 = pd.read_csv(data_dir / "day0_chain.csv")
-    k0, iv0, T0, chain0_used = build_spx_smile(chain0, k_min=k_min, k_max=k_max) #, r=r, q=q)
-    res_fixed_0 = calibrate_fixedk_from_smile(k0, iv0, T0, device=device)
+    k0, iv0, T0, chain0_used = build_spx_smile(chain0, k_min=k_min, k_max=k_max)
+
+    iv_bid0 = chain0_used["iv_bid_filled"].to_numpy(dtype=np.float32)
+    iv_ask0 = chain0_used["iv_ask_filled"].to_numpy(dtype=np.float32)
+
+    res_fixed_0_uniform = calibrate_fixedk_from_smile(
+        k0,
+        iv0,
+        T0,
+        device=device,
+        use_weights=False,
+    )
+
+    res_fixed_0_weighted_tau10 = calibrate_fixedk_from_smile(
+        k0,
+        iv0,
+        T0,
+        iv_bid=iv_bid0,
+        iv_ask=iv_ask0,
+        device=device,
+        use_weights=True,
+        weight_tau=0.05,
+    )
+
+    res_fixed_0_weighted_tau30 = calibrate_fixedk_from_smile(
+        k0,
+        iv0,
+        T0,
+        iv_bid=iv_bid0,
+        iv_ask=iv_ask0,
+        device=device,
+        use_weights=True,
+        weight_tau=0.30,
+    )
+
     res_cts_0 = calibrate_ctsk_from_smile(k0, iv0, T0, device=device)
-    theta_fixed_0 = np.asarray(res_fixed_0["theta_hat_raw"], dtype=np.float32)
+
+    theta_fixed_0_uniform = np.asarray(res_fixed_0_uniform["theta_hat_raw"], dtype=np.float32)
+    theta_fixed_0_weighted_tau10 = np.asarray(res_fixed_0_weighted_tau10["theta_hat_raw"], dtype=np.float32)
+    theta_fixed_0_weighted_tau30 = np.asarray(res_fixed_0_weighted_tau30["theta_hat_raw"], dtype=np.float32)
     theta_cts_0 = np.asarray(res_cts_0["theta_hat_raw"], dtype=np.float32)
-    
 
     # --------------------------------------------------------
     # Day-0 BS IV (fixed throughout)
     # --------------------------------------------------------
     S0 = float(quotes.loc[0, "underlyingPrice"])
-    V0 = float(quotes.loc[0, "mid"])
+    V0_quote = float(quotes.loc[0, "mid"])
     T0_held = float(quotes.loc[0, "dte"]) / 365.0
-    # sigma_bs0 = implied_vol_call_from_price(V0, S0, K, T0_held, r=r, q=q)
-    sigma_bs0 = bs_implied_vol_call(V0, S0, K, T0_held, r=r, q=q)
+    sigma_bs0 = bs_implied_vol_call(V0_quote, S0, K, T0_held, r=r, q=q)
     print(f"Using fixed day-0 BS IV throughout hedge: sigma_bs0 = {sigma_bs0:.6f}")
+
+    print("Day-0 fixed uniform metrics:", res_fixed_0_uniform.get("metrics"))
+    print("Day-0 fixed uniform weighted metrics:", res_fixed_0_uniform.get("weighted_metrics"))
+    print("Day-0 fixed uniform ATM 0.05:", res_fixed_0_uniform.get("atm_metrics_005"))
+
+    print("Day-0 fixed weighted tau=0.10 metrics:", res_fixed_0_weighted_tau10.get("metrics"))
+    print("Day-0 fixed weighted tau=0.10 weighted metrics:", res_fixed_0_weighted_tau10.get("weighted_metrics"))
+    print("Day-0 fixed weighted tau=0.10 ATM 0.05:", res_fixed_0_weighted_tau10.get("atm_metrics_005"))
+
+    print("Day-0 fixed weighted tau=0.30 metrics:", res_fixed_0_weighted_tau30.get("metrics"))
+    print("Day-0 fixed weighted tau=0.30 weighted metrics:", res_fixed_0_weighted_tau30.get("weighted_metrics"))
+    print("Day-0 fixed weighted tau=0.30 ATM 0.05:", res_fixed_0_weighted_tau30.get("atm_metrics_005"))
 
     # --------------------------------------------------------
     # state setup
     # --------------------------------------------------------
-
     c_fac, gamma_fac = fit_kernel_weights(n=10, x_n=3.92, alpha=0.51)
     c_fac = np.asarray(c_fac, dtype=np.float64)
     gamma_fac = np.asarray(gamma_fac, dtype=np.float64)
 
-    z_fixed_state = theta_fixed_0[5:15].copy()
+    z_fixed_uniform_state = theta_fixed_0_uniform[5:15].copy()
+    z_fixed_weighted_tau10_state = theta_fixed_0_weighted_tau10[5:15].copy()
+    z_fixed_weighted_tau30_state = theta_fixed_0_weighted_tau30[5:15].copy()
     z_cts_state = theta_cts_0[5:15].copy()
 
     # --------------------------------------------------------
@@ -460,82 +514,163 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
     # --------------------------------------------------------
     rows = []
 
-    for idx_row, row in quotes.iterrows():
-        qdate = row["quote_date"]
-        S = float(row["underlyingPrice"])
-        V_mkt = float(row["mid"])
-        T = float(row["dte"]) / 365.0
+    for idx_row, qrow in quotes.iterrows():
+        qdate = qrow["quote_date"]
+        S = float(qrow["underlyingPrice"])
+        V_mkt = float(qrow["mid"])
+        T = float(qrow["dte"]) / 365.0
         k_hold = math.log(K / S)
 
         if idx_row == 0:
-            theta_fixed = theta_fixed_0.copy()
+            theta_fixed_uniform = theta_fixed_0_uniform.copy()
+            theta_fixed_weighted_tau10 = theta_fixed_0_weighted_tau10.copy()
+            theta_fixed_weighted_tau30 = theta_fixed_0_weighted_tau30.copy()
             theta_cts = theta_cts_0.copy()
         else:
             prev_S = float(rows[-1]["S"])
             prev_date = rows[-1]["quote_date"]
             dt_years = business_dt_years(prev_date, qdate)
 
-            z_fixed_state = update_z_state_one_step_kfac(
-                theta_fixed_0, z_fixed_state, prev_S, S, c_fac, gamma_fac, dt_years
+            z_fixed_uniform_state = update_z_state_one_step_kfac(
+                theta_fixed_0_uniform, z_fixed_uniform_state, prev_S, S, c_fac, gamma_fac, dt_years
+            )
+            z_fixed_weighted_tau10_state = update_z_state_one_step_kfac(
+                theta_fixed_0_weighted_tau10, z_fixed_weighted_tau10_state, prev_S, S, c_fac, gamma_fac, dt_years
+            )
+            z_fixed_weighted_tau30_state = update_z_state_one_step_kfac(
+                theta_fixed_0_weighted_tau30, z_fixed_weighted_tau30_state, prev_S, S, c_fac, gamma_fac, dt_years
             )
             z_cts_state = update_z_state_one_step_kfac(
                 theta_cts_0, z_cts_state, prev_S, S, c_fac, gamma_fac, dt_years
             )
 
-            theta_fixed = theta_fixed_0.copy()
-            theta_fixed[5:15] = z_fixed_state
+            theta_fixed_uniform = theta_fixed_0_uniform.copy()
+            theta_fixed_uniform[5:15] = z_fixed_uniform_state
+
+            theta_fixed_weighted_tau10 = theta_fixed_0_weighted_tau10.copy()
+            theta_fixed_weighted_tau10[5:15] = z_fixed_weighted_tau10_state
+
+            theta_fixed_weighted_tau30 = theta_fixed_0_weighted_tau30.copy()
+            theta_fixed_weighted_tau30[5:15] = z_fixed_weighted_tau30_state
 
             theta_cts = theta_cts_0.copy()
             theta_cts[5:15] = z_cts_state
 
-        # 
+        # ----------------------------------------------------
+        # Delta inputs
+        # ----------------------------------------------------
         sigma_bs = sigma_bs0
         delta_bs = bs_call_delta(S, K, T, sigma_bs0, r=r, q=q) if np.isfinite(sigma_bs0) else np.nan
 
-        sigma_fixed, dsigmadk_fixed, dsig_dz_fixed = fixedk_sigma_skew_and_zsens(theta_fixed, T, k_hold, device)
-        delta_fixed, direct_fixed, factor_fixed = model_delta(
-            S, K, T, sigma_fixed, dsigmadk_fixed, dsig_dz_fixed,
-            eta=float(theta_fixed[4]), r=r, q=q
+        sigma_fixed_uniform, dsigmadk_fixed_uniform, dsig_dz_fixed_uniform = fixedk_sigma_skew_and_zsens(
+            theta_fixed_uniform, T, k_hold, device
+        )
+        delta_fixed_uniform, direct_fixed_uniform, factor_fixed_uniform = model_delta(
+            S,
+            K,
+            T,
+            sigma_fixed_uniform,
+            dsigmadk_fixed_uniform,
+            dsig_dz_fixed_uniform,
+            eta=float(theta_fixed_uniform[4]),
+            r=r,
+            q=q,
+        )
+
+        sigma_fixed_weighted_tau10, dsigmadk_fixed_weighted_tau10, dsig_dz_fixed_weighted_tau10 = fixedk_sigma_skew_and_zsens(
+            theta_fixed_weighted_tau10, T, k_hold, device
+        )
+        delta_fixed_weighted_tau10, direct_fixed_weighted_tau10, factor_fixed_weighted_tau10 = model_delta(
+            S,
+            K,
+            T,
+            sigma_fixed_weighted_tau10,
+            dsigmadk_fixed_weighted_tau10,
+            dsig_dz_fixed_weighted_tau10,
+            eta=float(theta_fixed_weighted_tau10[4]),
+            r=r,
+            q=q,
+        )
+
+        sigma_fixed_weighted_tau30, dsigmadk_fixed_weighted_tau30, dsig_dz_fixed_weighted_tau30 = fixedk_sigma_skew_and_zsens(
+            theta_fixed_weighted_tau30, T, k_hold, device
+        )
+        delta_fixed_weighted_tau30, direct_fixed_weighted_tau30, factor_fixed_weighted_tau30 = model_delta(
+            S,
+            K,
+            T,
+            sigma_fixed_weighted_tau30,
+            dsigmadk_fixed_weighted_tau30,
+            dsig_dz_fixed_weighted_tau30,
+            eta=float(theta_fixed_weighted_tau30[4]),
+            r=r,
+            q=q,
         )
 
         sigma_cts, dsigmadk_cts, dsig_dz_cts = ctsk_sigma_skew_and_zsens(theta_cts, T, k_hold, device)
         delta_cts, direct_cts, factor_cts = model_delta(
-            S, K, T, sigma_cts, dsigmadk_cts, dsig_dz_cts,
-            eta=float(theta_cts[4]), r=r, q=q
+            S,
+            K,
+            T,
+            sigma_cts,
+            dsigmadk_cts,
+            dsig_dz_cts,
+            eta=float(theta_cts[4]),
+            r=r,
+            q=q,
         )
 
+        rows.append(
+            {
+                "quote_date": qdate,
+                "S": S,
+                "K": K,
+                "T": T,
+                "k_hold": k_hold,
+                "V_mkt": V_mkt,
+                "sigma_bs": sigma_bs,
+                "delta_bs": delta_bs,
 
-        rows.append({
-            "quote_date": qdate,
-            "S": S,
-            "K": K,
-            "T": T,
-            "k_hold": k_hold,
-            "V_mkt": V_mkt,
-            "sigma_bs": sigma_bs,
-            "delta_bs": delta_bs,
+                "sigma_fixed_uniform": sigma_fixed_uniform,
+                "dsigmadk_fixed_uniform": dsigmadk_fixed_uniform,
+                "delta_fixed_uniform": delta_fixed_uniform,
 
-            "sigma_fixed": sigma_fixed,
-            "dsigmadk_fixed": dsigmadk_fixed,
-            "delta_fixed": delta_fixed,
+                "sigma_fixed_weighted_tau10": sigma_fixed_weighted_tau10,
+                "dsigmadk_fixed_weighted_tau10": dsigmadk_fixed_weighted_tau10,
+                "delta_fixed_weighted_tau10": delta_fixed_weighted_tau10,
 
+                "sigma_fixed_weighted_tau30": sigma_fixed_weighted_tau30,
+                "dsigmadk_fixed_weighted_tau30": dsigmadk_fixed_weighted_tau30,
+                "delta_fixed_weighted_tau30": delta_fixed_weighted_tau30,
 
-            "sigma_cts": sigma_cts,
-            "dsigmadk_cts": dsigmadk_cts,
-            "delta_cts": delta_cts,
+                "sigma_cts": sigma_cts,
+                "dsigmadk_cts": dsigmadk_cts,
+                "delta_cts": delta_cts,
 
-            "theta_fixed_used": theta_fixed.copy(),
-            "theta_cts_used": theta_cts.copy(),
-            "z_fixed_norm": float(np.linalg.norm(theta_fixed[5:15])),
-            "z_cts_norm": float(np.linalg.norm(theta_cts[5:15])),
-        })
+                "theta_fixed_uniform_used": theta_fixed_uniform.copy(),
+                "theta_fixed_weighted_tau10_used": theta_fixed_weighted_tau10.copy(),
+                "theta_fixed_weighted_tau30_used": theta_fixed_weighted_tau30.copy(),
+                "theta_cts_used": theta_cts.copy(),
+
+                "z_fixed_uniform_norm": float(np.linalg.norm(theta_fixed_uniform[5:15])),
+                "z_fixed_weighted_tau10_norm": float(np.linalg.norm(theta_fixed_weighted_tau10[5:15])),
+                "z_fixed_weighted_tau30_norm": float(np.linalg.norm(theta_fixed_weighted_tau30[5:15])),
+                "z_cts_norm": float(np.linalg.norm(theta_cts[5:15])),
+            }
+        )
 
     hd = pd.DataFrame(rows).sort_values("quote_date").reset_index(drop=True)
 
     # --------------------------------------------------------
     # Self-financing hedged portfolios
     # --------------------------------------------------------
-    for label, delta_col in [("bs", "delta_bs"), ("fixed", "delta_fixed"), ("cts", "delta_cts")]:
+    for label, delta_col in [
+        ("bs", "delta_bs"),
+        ("fixed_uniform", "delta_fixed_uniform"),
+        ("fixed_weighted_tau10", "delta_fixed_weighted_tau10"),
+        ("fixed_weighted_tau30", "delta_fixed_weighted_tau30"),
+        ("cts", "delta_cts"),
+    ]:
         stock_pos = np.zeros(len(hd))
         cash = np.zeros(len(hd))
         total = np.zeros(len(hd))
@@ -569,20 +704,48 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
     V0 = float(hd.loc[0, "V_mkt"])
     hd["V0"] = V0
     hd["hedge_error_bs_norm"] = hd["hedge_error_bs"] / V0
-    hd["hedge_error_fixed_norm"] = hd["hedge_error_fixed"] / V0
+    hd["hedge_error_fixed_uniform_norm"] = hd["hedge_error_fixed_uniform"] / V0
+    hd["hedge_error_fixed_weighted_tau10_norm"] = hd["hedge_error_fixed_weighted_tau10"] / V0
+    hd["hedge_error_fixed_weighted_tau30_norm"] = hd["hedge_error_fixed_weighted_tau30"] / V0
     hd["hedge_error_cts_norm"] = hd["hedge_error_cts"] / V0
 
     metrics = {
-        #"mode": mode,
         "n_dates": int(len(hd)),
         "V0": float(V0),
+
         "bs": summarise_hedge(hd, "hedge_error_bs"),
-        "fixed": summarise_hedge(hd, "hedge_error_fixed"),
+        "fixed_uniform": summarise_hedge(hd, "hedge_error_fixed_uniform"),
+        "fixed_weighted_tau10": summarise_hedge(hd, "hedge_error_fixed_weighted_tau10"),
+        "fixed_weighted_tau30": summarise_hedge(hd, "hedge_error_fixed_weighted_tau30"),
         "cts": summarise_hedge(hd, "hedge_error_cts"),
+
         "bs_norm": summarise_hedge(hd, "hedge_error_bs_norm"),
-        "fixed_norm": summarise_hedge(hd, "hedge_error_fixed_norm"),
+        "fixed_uniform_norm": summarise_hedge(hd, "hedge_error_fixed_uniform_norm"),
+        "fixed_weighted_tau10_norm": summarise_hedge(hd, "hedge_error_fixed_weighted_tau10_norm"),
+        "fixed_weighted_tau30_norm": summarise_hedge(hd, "hedge_error_fixed_weighted_tau30_norm"),
         "cts_norm": summarise_hedge(hd, "hedge_error_cts_norm"),
-        # "delta_diag": delta_diag,
+
+        "day0_fixed_uniform_calibration": {
+            "metrics": res_fixed_0_uniform.get("metrics"),
+            "weighted_metrics": res_fixed_0_uniform.get("weighted_metrics"),
+            "atm_metrics_003": res_fixed_0_uniform.get("atm_metrics_003"),
+            "atm_metrics_005": res_fixed_0_uniform.get("atm_metrics_005"),
+            "atm_metrics_007": res_fixed_0_uniform.get("atm_metrics_007"),
+        },
+        "day0_fixed_weighted_tau10_calibration": {
+            "metrics": res_fixed_0_weighted_tau10.get("metrics"),
+            "weighted_metrics": res_fixed_0_weighted_tau10.get("weighted_metrics"),
+            "atm_metrics_003": res_fixed_0_weighted_tau10.get("atm_metrics_003"),
+            "atm_metrics_005": res_fixed_0_weighted_tau10.get("atm_metrics_005"),
+            "atm_metrics_007": res_fixed_0_weighted_tau10.get("atm_metrics_007"),
+        },
+        "day0_fixed_weighted_tau30_calibration": {
+            "metrics": res_fixed_0_weighted_tau30.get("metrics"),
+            "weighted_metrics": res_fixed_0_weighted_tau30.get("weighted_metrics"),
+            "atm_metrics_003": res_fixed_0_weighted_tau30.get("atm_metrics_003"),
+            "atm_metrics_005": res_fixed_0_weighted_tau30.get("atm_metrics_005"),
+            "atm_metrics_007": res_fixed_0_weighted_tau30.get("atm_metrics_007"),
+        },
     }
 
     # --------------------------------------------------------
@@ -592,7 +755,9 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
 
     plt.figure(figsize=(9, 5))
     plt.plot(x, hd["hedge_error_bs_norm"], color="cornflowerblue", linewidth=1.5, label="BS hedge / V0")
-    plt.plot(x, hd["hedge_error_fixed_norm"], linewidth=1.5, color="goldenrod", label="Fixed-k hedge / V0")
+    plt.plot(x, hd["hedge_error_fixed_uniform_norm"], linewidth=1.5, color="goldenrod", label="Fixed-k uniform / V0")
+    plt.plot(x, hd["hedge_error_fixed_weighted_tau10_norm"], linewidth=1.5, color="darkorange", label="Fixed-k weighted tau=0.10 / V0")
+    plt.plot(x, hd["hedge_error_fixed_weighted_tau30_norm"], linewidth=1.5, color="sienna", label="Fixed-k weighted tau=0.30 / V0")
     plt.plot(x, hd["hedge_error_cts_norm"], linewidth=1.5, color="seagreen", label="Cts-k hedge / V0")
     plt.axhline(0.0, color="black", linewidth=1)
     plt.title(f"Normalised SPX hedge error | Expiry = {expiry_str}")
@@ -600,50 +765,120 @@ def run_hedge(data_dir: Path, out_dir: Path, k_min: float, k_max: float, r: floa
     plt.ylabel("hedged portfolio value / V0")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_dir / f"hedge_error_norm.png", dpi=150)
+    plt.savefig(out_dir / "hedge_error_norm.png", dpi=150)
     plt.show()
 
     plt.figure(figsize=(9, 5))
-    plt.plot(x, hd["delta_bs"], linewidth=1.2, color="cornflowerblue",label="BS delta")
-    plt.plot(x, hd["delta_fixed"], linewidth=1.2, color="goldenrod", label="Fixed-k delta")
-    plt.plot(x, hd["delta_cts"], linewidth=1.2, color="seagreen",label="Cts-k delta")
+    plt.plot(x, hd["delta_bs"], linewidth=1.2, color="cornflowerblue", label="BS delta")
+    plt.plot(x, hd["delta_fixed_uniform"], linewidth=1.2, color="goldenrod", label="Fixed-k uniform")
+    plt.plot(x, hd["delta_fixed_weighted_tau10"], linewidth=1.2, color="darkorange", label="Fixed-k weighted tau=0.10")
+    plt.plot(x, hd["delta_fixed_weighted_tau30"], linewidth=1.2, color="sienna", label="Fixed-k weighted tau=0.30")
+    plt.plot(x, hd["delta_cts"], linewidth=1.2, color="seagreen", label="Cts-k delta")
     plt.title(f"Delta paths | Expiry = {expiry_str}")
     plt.xlabel("date")
     plt.ylabel("delta")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_dir / f"delta_paths.png", dpi=150)
+    plt.savefig(out_dir / "delta_paths.png", dpi=150)
     plt.show()
 
-
-    hd.to_csv(out_dir / f"hedge_timeseries.csv", index=False)
-    with open(out_dir / f"hedge_metrics.json", "w") as f:
+    hd.to_csv(out_dir / "hedge_timeseries.csv", index=False)
+    with open(out_dir / "hedge_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    if res_fixed_0 is not None and res_cts_0 is not None and chain0_used is not None:
+    if chain0_used is not None:
+        # full smile overlay
         plt.figure(figsize=(8, 4))
-        plt.scatter(chain0_used["k_log_money"], chain0_used["iv_bid_filled"], marker="x", s=18, color="tomato", label="bid IV")
-        plt.scatter(chain0_used["k_log_money"], chain0_used["iv_ask_filled"], marker="x", s=18, color="mediumslateblue", label="ask IV")
-        plt.plot(res_fixed_0["k_obs"], res_fixed_0["iv_hat"], linewidth=1.5, color="goldenrod", label="fixed-k fit")
+        plt.scatter(
+            chain0_used["k_log_money"],
+            chain0_used["iv_bid_filled"],
+            marker="x",
+            s=18,
+            color="tomato",
+            label="bid IV",
+        )
+        plt.scatter(
+            chain0_used["k_log_money"],
+            chain0_used["iv_ask_filled"],
+            marker="x",
+            s=18,
+            color="mediumslateblue",
+            label="ask IV",
+        )
+        plt.plot(res_fixed_0_uniform["k_obs"], res_fixed_0_uniform["iv_hat"], linewidth=1.5, color="goldenrod", label="fixed-k uniform")
+        plt.plot(res_fixed_0_weighted_tau10["k_obs"], res_fixed_0_weighted_tau10["iv_hat"], linewidth=1.5, color="darkorange", label="fixed-k weighted tau=0.10")
+        plt.plot(res_fixed_0_weighted_tau30["k_obs"], res_fixed_0_weighted_tau30["iv_hat"], linewidth=1.5, color="sienna", label="fixed-k weighted tau=0.30")
         plt.plot(res_cts_0["k_obs"], res_cts_0["iv_hat"], linewidth=1.5, color="seagreen", label="cts-k fit")
         plt.xlabel("log-moneyness k")
         plt.ylabel("implied vol")
-        plt.title("Day-0 SPX calibration | ")
+        plt.title("Day-0 SPX calibration")
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_dir / "day0_calibration_overlay.png", dpi=150)
         plt.show()
 
-        # zoomed in plot of the same
-        atm_mask = (chain0_used["k_log_money"] >= -0.00) & (chain0_used["k_log_money"] <= 0.06)
+        # ATM zoom
+        atm_mask_quotes = (chain0_used["k_log_money"] >= -0.02) & (chain0_used["k_log_money"] <= 0.06)
         plt.figure(figsize=(8, 4))
-        plt.scatter(chain0_used.loc[atm_mask, "k_log_money"],chain0_used.loc[atm_mask, "iv_bid_filled"],marker="x",s=18,color="tomato",label="bid IV",)
-        plt.scatter(chain0_used.loc[atm_mask, "k_log_money"],chain0_used.loc[atm_mask, "iv_ask_filled"],marker="x",s=18,color="mediumslateblue",label="ask IV",)
-        fixed_mask = (res_fixed_0["k_obs"] >= -0.00) & (res_fixed_0["k_obs"] <= 0.06)
-        cts_mask = (res_cts_0["k_obs"] >= -0.00) & (res_cts_0["k_obs"] <= 0.06)
-        plt.plot(np.asarray(res_fixed_0["k_obs"])[fixed_mask],np.asarray(res_fixed_0["iv_hat"])[fixed_mask],marker="o",markersize=3,linewidth=1.5,color="goldenrod",label="fixed-k fit",)
-        plt.plot(np.asarray(res_cts_0["k_obs"])[cts_mask],np.asarray(res_cts_0["iv_hat"])[cts_mask],marker="o",markersize=3,linewidth=1.5, color="seagreen",label="cts-k fit",)
-        plt.xlim(-0.00, 0.06)
+        plt.scatter(
+            chain0_used.loc[atm_mask_quotes, "k_log_money"],
+            chain0_used.loc[atm_mask_quotes, "iv_bid_filled"],
+            marker="x",
+            s=18,
+            color="tomato",
+            label="bid IV",
+        )
+        plt.scatter(
+            chain0_used.loc[atm_mask_quotes, "k_log_money"],
+            chain0_used.loc[atm_mask_quotes, "iv_ask_filled"],
+            marker="x",
+            s=18,
+            color="mediumslateblue",
+            label="ask IV",
+        )
+
+        fixed_uniform_mask = (np.asarray(res_fixed_0_uniform["k_obs"]) >= -0.02) & (np.asarray(res_fixed_0_uniform["k_obs"]) <= 0.06)
+        fixed_tau10_mask = (np.asarray(res_fixed_0_weighted_tau10["k_obs"]) >= -0.02) & (np.asarray(res_fixed_0_weighted_tau10["k_obs"]) <= 0.06)
+        fixed_tau30_mask = (np.asarray(res_fixed_0_weighted_tau30["k_obs"]) >= -0.02) & (np.asarray(res_fixed_0_weighted_tau30["k_obs"]) <= 0.06)
+        cts_mask = (np.asarray(res_cts_0["k_obs"]) >= -0.02) & (np.asarray(res_cts_0["k_obs"]) <= 0.06)
+
+        plt.plot(
+            np.asarray(res_fixed_0_uniform["k_obs"])[fixed_uniform_mask],
+            np.asarray(res_fixed_0_uniform["iv_hat"])[fixed_uniform_mask],
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            color="goldenrod",
+            label="fixed-k uniform",
+        )
+        plt.plot(
+            np.asarray(res_fixed_0_weighted_tau10["k_obs"])[fixed_tau10_mask],
+            np.asarray(res_fixed_0_weighted_tau10["iv_hat"])[fixed_tau10_mask],
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            color="darkorange",
+            label="fixed-k weighted tau=0.10",
+        )
+        plt.plot(
+            np.asarray(res_fixed_0_weighted_tau30["k_obs"])[fixed_tau30_mask],
+            np.asarray(res_fixed_0_weighted_tau30["iv_hat"])[fixed_tau30_mask],
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            color="sienna",
+            label="fixed-k weighted tau=0.30",
+        )
+        plt.plot(
+            np.asarray(res_cts_0["k_obs"])[cts_mask],
+            np.asarray(res_cts_0["iv_hat"])[cts_mask],
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            color="seagreen",
+            label="cts-k fit",
+        )
+        plt.xlim(-0.02, 0.06)
         plt.xlabel("log-moneyness k")
         plt.ylabel("implied vol")
         plt.title(f"Day-0 SPX calibration overlays (ATM zoom) | expiry={expiry_str}")
