@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from qrh_nn.train import set_seed
 from qrh_nn.dataset_k import PackedNPZDatasetK
 from qrh_nn.model_k import build_ctsk_model, ContinuousKConfig
 
@@ -18,10 +19,10 @@ from qrh_nn.model_k import build_ctsk_model, ContinuousKConfig
 # Small helpers
 # ============================================================
 
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# def set_seed(seed: int) -> None:
+#     np.random.seed(seed)
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed_all(seed)
 
 
 @torch.no_grad()

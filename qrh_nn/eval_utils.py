@@ -20,6 +20,9 @@ from qrh_nn.model_k import ContinuousKModel, ContinuousKConfig # build_ctsk_mode
 # PATHS
 REPO = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path(".")
 CKPT_FIXED = REPO / "models" / "full_mtp" / "checkpoints_resmlp_03" / "best.pt"
+CKPT_FIXED_ARB_LAM01 = REPO / "models" / "full_mtp" / "checkpoints_resmlp_arb_spxconv_lam01" / "best.pt"
+CKPT_FIXED_ARB_LAM10 = REPO / "models" / "full_mtp" / "checkpoints_resmlp_arb_spxconv_lam10" / "best.pt"
+CKPT_FIXED_ARB_LAM50 = REPO / "models" / "full_mtp" / "checkpoints_resmlp_arb_spxconv_lam50" / "best.pt"
 NORM_FIXED = REPO / "models" / "norm" / "norm.npz"
 
 CKPT_CTSK = REPO / "models" / "full_mtp_spxk" / "modelA_run01" / "best.pt"
@@ -50,6 +53,22 @@ def _device_or_default(device: Optional[torch.device | str] = None) -> torch.dev
 
 def _as_t(x, device: torch.device) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32, device=device)
+
+
+def _jsonable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_jsonable(v) for v in obj]
+    return obj
 
 
 
@@ -147,14 +166,24 @@ MODEL_SPECS = {
     },
 }
 
-def load_model_and_norm(model_type: str, device: torch.device):
+def load_model_and_norm(
+        model_type: str, 
+        device: torch.device,
+        *,
+        ckpt_override: Optional[Path] = None,
+        norm_override: Optional[Path] = None
+):
     model_type = model_type.lower()
     if model_type not in MODEL_SPECS:
         raise ValueError(f"Unknown model_type={model_type!r}. Available: {list(MODEL_SPECS)}")
 
     spec = MODEL_SPECS[model_type]
 
-    ckpt = torch.load(spec["ckpt"], map_location="cpu")
+    ckpt_path = Path(ckpt_override) if ckpt_override is not None else Path(spec["ckpt"])
+    norm_path = Path(norm_override) if norm_override is not None else Path(spec["norm"])
+
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("model_state") or ckpt.get("model") or ckpt.get("state_dict")
     if state is None:
         raise KeyError("something's missing boy")
@@ -167,7 +196,7 @@ def load_model_and_norm(model_type: str, device: torch.device):
     model.load_state_dict(state)
     model.eval()
 
-    with np.load(spec["norm"], allow_pickle=False) as z:
+    with np.load(norm_path, allow_pickle=False) as z:
         X_mu = z["X_mu"].astype(np.float32, copy=False)
         X_sd = z["X_sd"].astype(np.float32, copy=False)
         Y_mu = z["Y_mu"].astype(np.float32, copy=False)

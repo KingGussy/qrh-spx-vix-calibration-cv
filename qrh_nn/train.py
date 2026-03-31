@@ -60,7 +60,7 @@ def evaluate(
         y_raw = Yb * Y_sd + Y_mu
         abs_errors.append((pred_raw - y_raw).abs().detach().cpu())
 
-    val_loss_norm = total_loss / max(1, n)
+    val_loss_norm = total_loss / n
 
     abs_err = torch.cat(abs_errors, dim=0).reshape(-1)  # flatten over samples and dims
     mae_iv = float(abs_err.mean())
